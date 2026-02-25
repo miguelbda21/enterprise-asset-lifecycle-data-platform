@@ -1,0 +1,30 @@
+## requirements.txt
+
+This is a solid baseline for **data engineering + validation + testing** without going too heavy:
+
+```txt
+# Core data / pipeline
+pandas>=2.2.0
+numpy>=1.26.0
+requests>=2.31.0
+python-dotenv>=1.0.1
+
+# Database connectivity (SQL Server, Postgres, etc.)
+SQLAlchemy>=2.0.0
+
+# Data validation / schemas (lightweight)
+pydantic>=2.6.0
+
+# Notebook support (optional but useful)
+jupyter>=1.0.0
+
+# Testing
+pytest>=8.0.0
+
+# Code quality
+black>=24.1.0
+ruff>=0.2.0
+mypy>=1.8.0
+
+# (Optional) Data quality framework — enable when you’re ready
+# great-expectations>=0.18.0

@@ -198,9 +198,8 @@ data/warehouse/*
 *.sqlite3
 *.db
 
-# Logs
+# Logs (already covered above, but keeping centralized here is fine)
 logs/
-*.log
 
 # VS Code
 .vscode/

@@ -1,5 +1,8 @@
 from fastapi import FastAPI
 from src.api.routes import devices, incidents, lifecycle
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 app = FastAPI(
     title="Enterprise Asset Lifecycle API",

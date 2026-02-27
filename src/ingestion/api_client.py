@@ -1,4 +1,7 @@
 # src/ingestion/api_client.py
+from __future__ import annotations
+
+import logging
 import os
 import time
 from typing import Any, Dict, List, Optional
@@ -7,6 +10,8 @@ import requests
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 
@@ -38,6 +43,14 @@ def fetch_all(
     all_rows: List[Dict[str, Any]] = []
     offset = 0
 
+    logger.info(
+        "Starting fetch_all endpoint=%s page_size=%s max_retries=%s base_url=%s",
+        endpoint,
+        page_size,
+        max_retries,
+        API_BASE_URL,
+    )
+
     while True:
         paged_params = dict(params)
         paged_params.update({"limit": page_size, "offset": offset})
@@ -47,14 +60,11 @@ def fetch_all(
         payload: Optional[Dict[str, Any]] = None
         last_error: Optional[Exception] = None
 
-        # Retry loop
         for attempt in range(1, max_retries + 1):
             try:
-                response = requests.get(
-                    url,
-                    params=paged_params,
-                    timeout=timeout_seconds,
-                )
+                logger.debug("GET %s params=%s (attempt %d/%d)", url, paged_params, attempt, max_retries)
+
+                response = requests.get(url, params=paged_params, timeout=timeout_seconds)
                 response.raise_for_status()
 
                 json_body = response.json()
@@ -62,53 +72,61 @@ def fetch_all(
                     raise ValueError(f"Expected JSON object but received {type(json_body)}")
 
                 payload = json_body
-                last_error = None
                 break
 
             except requests.HTTPError as exc:
-                # We got an HTTP response, but it was 4xx/5xx
+                # Use exc.response (safe) instead of relying on a local 'response'
+                response_obj = getattr(exc, "response", None)
+                status_code = getattr(response_obj, "status_code", None)
+
                 body = ""
-                try:
-                    body = response.text
-                except Exception:
-                    body = ""
+                if response_obj is not None:
+                    text = getattr(response_obj, "text", "")
+                    if isinstance(text, str):
+                        body = text
 
-                if attempt < max_retries:
-                    time.sleep(1.5 * attempt)
-                    continue
-
-                status = getattr(response, "status_code", "n/a")
-                resp_url = getattr(response, "url", url)
-
-                raise RuntimeError(
-                    f"Failed GET {resp_url} (status={status}). "
-                    f"Response body: {body[:1000]}"
-                ) from exc
-
-            except (requests.RequestException, ValueError) as exc:
-                # RequestException: network/timeout/etc
-                # ValueError: JSON parsing issue / our JSON type check
                 last_error = exc
+                logger.exception(
+                    "HTTP error fetching %s (attempt %d/%d). status=%s body=%s",
+                    url,
+                    attempt,
+                    max_retries,
+                    status_code if status_code is not None else "n/a",
+                    body[:1000],
+                )
 
-                if attempt < max_retries:
-                    time.sleep(1.5 * attempt)
-                    continue
+                if attempt >= max_retries:
+                    raise RuntimeError(
+                        f"Failed GET {url} (status={status_code if status_code is not None else 'n/a'}). "
+                        f"Response body: {body[:1000]}"
+                    ) from exc
 
-                raise RuntimeError(
-                    f"Failed GET {url} after {max_retries} retries: {exc}"
-                ) from exc
+                time.sleep(1.5 * attempt)
+
+            except (requests.RequestException, ValueError, KeyError) as exc:
+                # Network issues, JSON decode issues, or validation issues
+                last_error = exc
+                logger.exception(
+                    "Request/parse error fetching %s (attempt %d/%d): %s",
+                    url,
+                    attempt,
+                    max_retries,
+                    exc,
+                )
+
+                if attempt >= max_retries:
+                    raise RuntimeError(f"Failed GET {url} after {max_retries} retries: {exc}") from exc
+
+                time.sleep(1.5 * attempt)
 
         if payload is None:
             raise RuntimeError(f"No payload returned from {url}. Last error: {last_error}")
 
         rows = payload.get("data")
-
         if rows is None:
             raise KeyError(
-                f"Response from {url} does not contain 'data'. "
-                f"Keys found: {list(payload.keys())}"
+                f"Response from {url} does not contain 'data'. Keys found: {list(payload.keys())}"
             )
-
         if not isinstance(rows, list):
             raise ValueError(f"'data' must be a list, got {type(rows)}")
 
@@ -116,6 +134,15 @@ def fetch_all(
 
         returned = payload.get("returned_records", len(rows))
         total = payload.get("total_records")
+
+        logger.info(
+            "Fetched page endpoint=%s offset=%d returned=%s total=%s accumulated=%d",
+            endpoint,
+            offset,
+            returned,
+            total,
+            len(all_rows),
+        )
 
         # Stop conditions
         if returned == 0:
@@ -132,6 +159,7 @@ def fetch_all(
         if sleep_seconds > 0:
             time.sleep(sleep_seconds)
 
+    logger.info("Completed fetch_all endpoint=%s total_rows=%d", endpoint, len(all_rows))
     return all_rows
 
 
@@ -149,6 +177,7 @@ def fetch_lifecycle_events(limit: int = 500) -> List[Dict[str, Any]]:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
     print("Testing API client...")
 
     devices = fetch_devices()

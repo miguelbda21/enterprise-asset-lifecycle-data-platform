@@ -1,77 +1,128 @@
 # src/pipelines/load_staging_from_api.py
 from __future__ import annotations
 
+import logging
+from typing import Final
+
 import pandas as pd
 from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError, ProgrammingError
+from sqlalchemy.engine import Connection
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 
 from src.ingestion.api_client import fetch_all
 from src.utils.database import get_engine
 
+# ---------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------
+logger = logging.getLogger(__name__)
 
-def _auto_chunk_size(df: pd.DataFrame, max_params: int = 2000, min_chunk: int = 1) -> int:
-    """
-    SQL Server has ~2100 parameter limit per statement.
-    With pandas.to_sql(method="multi"), params ~= rows_in_chunk * num_columns.
-    We pick: floor(max_params / num_columns), with some headroom.
-    """
-    num_cols = int(df.shape[1])
-    if num_cols <= 0:
-        return min_chunk
+# If you already configure logging elsewhere (recommended), remove this block.
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    )
 
-    chunk = max_params // num_cols
-    return max(min_chunk, int(chunk))
+# ---------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------
+DEFAULT_PAGE_SIZE: Final[int] = 500
+DEFAULT_CHUNK_SIZE: Final[int] = 1000
 
 
-def load_table(table_name: str, endpoint: str, page_size: int = 500) -> int:
+def _split_schema_table(full_name: str) -> tuple[str, str]:
     """
-    Pulls data from REST endpoint and loads into a SQL Server staging table.
-    Full refresh approach: TRUNCATE (or DELETE fallback) + INSERT.
+    Splits 'schema.table' into ('schema', 'table').
+
+    Raises ValueError if format is invalid.
     """
+    parts = full_name.split(".")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ValueError(
+            f"Expected table_name in 'schema.table' format, got: {full_name!r}"
+        )
+    return parts[0], parts[1]
+
+
+def _truncate_or_delete(conn: Connection, schema: str, table: str) -> None:
+    """
+    Try TRUNCATE first (fast). If not allowed (FK/permissions), fallback to DELETE.
+    Uses specific SQLAlchemy/DB exceptions to avoid "too broad exception clause".
+    """
+    # NOTE: parameterizing identifiers isn't supported; these are internal constants
+    # you control (not user input). Keep them controlled.
+    truncate_sql = text(f"TRUNCATE TABLE [{schema}].[{table}];")
+    delete_sql = text(f"DELETE FROM [{schema}].[{table}];")
+
+    try:
+        conn.execute(truncate_sql)
+        logger.info("Truncated %s.%s", schema, table)
+    except (DBAPIError, SQLAlchemyError) as exc:
+        logger.warning(
+            "TRUNCATE failed for %s.%s; falling back to DELETE. Reason: %s",
+            schema,
+            table,
+            exc,
+        )
+        conn.execute(delete_sql)
+        logger.info("Deleted rows from %s.%s", schema, table)
+
+
+def load_table(
+    table_name: str,
+    endpoint: str,
+    *,
+    page_size: int = DEFAULT_PAGE_SIZE,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+) -> int:
+    """
+    Pull data from a REST endpoint and load into a SQL Server staging table.
+
+    Current strategy: full refresh (truncate/delete + append load).
+    """
+    schema, table = _split_schema_table(table_name)
+
     rows = fetch_all(endpoint, page_size=page_size)
     df = pd.DataFrame(rows)
 
     if df.empty:
-        print(f"⚠️ No rows returned for {endpoint}. Skipping {table_name}.")
+        logger.warning("No rows returned for endpoint=%s. Skipping %s.", endpoint, table_name)
         return 0
-
-    # Automatic chunk sizing to avoid SQL Server parameter-limit failures
-    chunk_size = _auto_chunk_size(df, max_params=2000, min_chunk=1)
-
-    # Expect "schema.table"
-    schema, tbl = table_name.split(".", 1)
 
     engine = get_engine()
 
-    # Use engine.connect() + conn.begin() to keep typing/lint happy
+    # Using engine.begin() returns a proper context manager and auto-commits/rolls back.
     with engine.connect() as conn:
         with conn.begin():
-            try:
-                conn.execute(text(f"TRUNCATE TABLE {schema}.{tbl};"))
-            except (ProgrammingError, DBAPIError):
-                conn.execute(text(f"DELETE FROM {schema}.{tbl};"))
+            _truncate_or_delete(conn, schema=schema, table=table)
 
-            df.to_sql(
-                name=tbl,
-                schema=schema,
-                con=conn,
-                if_exists="append",
-                index=False,
-                chunksize=chunk_size,
-                method="multi",
-            )
+        # pandas uses parameter name `chunk size` (no underscore)
+        df.to_sql(
+            name=table,
+            schema=schema,
+            con=conn,  # Connection is fine
+            if_exists="append",
+            index=False,
+            chunksize=chunk_size,
+            method="multi",
+        )
 
-    print(
-        f"✅ Loaded {len(df):,} rows into {table_name} from {endpoint} "
-        f"(cols={df.shape[1]}, chunk_size={chunk_size})"
+    logger.info(
+        "Loaded %s rows into %s from %s (cols=%s, chunk_size=%s)",
+        f"{len(df):,}",
+        table_name,
+        endpoint,
+        len(df.columns),
+        chunk_size,
     )
     return int(len(df))
 
 
 def main() -> None:
-    load_table("staging.devices", "/devices")
-    load_table("staging.incidents", "/incidents")
-    load_table("staging.lifecycle_events", "/lifecycle-events")
+    load_table("staging.devices", "/devices", page_size=500, chunk_size=200)
+    load_table("staging.incidents", "/incidents", page_size=500, chunk_size=250)
+    load_table("staging.lifecycle_events", "/lifecycle-events", page_size=500, chunk_size=285)
 
 
 if __name__ == "__main__":

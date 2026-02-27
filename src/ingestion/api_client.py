@@ -1,3 +1,4 @@
+# src/ingestion/api_client.py
 import os
 import time
 from typing import Any, Dict, List, Optional
@@ -28,7 +29,6 @@ def fetch_all(
         "total_records": 12345
     }
     """
-
     if not endpoint.startswith("/"):
         endpoint = "/" + endpoint
 
@@ -58,28 +58,48 @@ def fetch_all(
                 response.raise_for_status()
 
                 json_body = response.json()
-
                 if not isinstance(json_body, dict):
-                    raise ValueError(
-                        f"Expected JSON object but received {type(json_body)}"
-                    )
+                    raise ValueError(f"Expected JSON object but received {type(json_body)}")
 
                 payload = json_body
+                last_error = None
                 break
 
-            except Exception as exc:
-                last_error = exc
+            except requests.HTTPError as exc:
+                # We got an HTTP response, but it was 4xx/5xx
+                body = ""
+                try:
+                    body = response.text
+                except Exception:
+                    body = ""
+
                 if attempt < max_retries:
                     time.sleep(1.5 * attempt)
-                else:
-                    raise RuntimeError(
-                        f"Failed GET {url} after {max_retries} retries: {exc}"
-                    ) from exc
+                    continue
+
+                status = getattr(response, "status_code", "n/a")
+                resp_url = getattr(response, "url", url)
+
+                raise RuntimeError(
+                    f"Failed GET {resp_url} (status={status}). "
+                    f"Response body: {body[:1000]}"
+                ) from exc
+
+            except (requests.RequestException, ValueError) as exc:
+                # RequestException: network/timeout/etc
+                # ValueError: JSON parsing issue / our JSON type check
+                last_error = exc
+
+                if attempt < max_retries:
+                    time.sleep(1.5 * attempt)
+                    continue
+
+                raise RuntimeError(
+                    f"Failed GET {url} after {max_retries} retries: {exc}"
+                ) from exc
 
         if payload is None:
-            raise RuntimeError(
-                f"No payload returned from {url}. Last error: {last_error}"
-            )
+            raise RuntimeError(f"No payload returned from {url}. Last error: {last_error}")
 
         rows = payload.get("data")
 
